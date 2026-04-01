@@ -884,6 +884,9 @@ class WanVideoSampler:
 
         #blockswap init
         _prefetch = perf_opts.get("block_swap_prefetch", 0)
+        if _prefetch > 0 and not transformer.use_non_blocking:
+            transformer.use_non_blocking = True
+            log.info("Performance: enabled non_blocking transfers for block swap prefetch")
         init_blockswap(transformer, block_swap_args, model, prefetch_blocks=_prefetch)
 
         # Multi-GPU setup (after blockswap/weights are loaded)
