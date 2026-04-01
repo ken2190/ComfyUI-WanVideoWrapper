@@ -29,6 +29,19 @@ from comfy.ldm.flux.math import apply_rope1 as apply_rope_comfy1
 from comfy.ldm.flux.math import apply_rope as apply_rope_comfy
 from comfy import model_management as mm
 
+
+def _move_tensors_to_device(data, device):
+    """Recursively move all tensors in a nested structure to a device."""
+    if data is None:
+        return None
+    if isinstance(data, torch.Tensor):
+        return data.to(device, non_blocking=True) if data.device != device else data
+    if isinstance(data, dict):
+        return {k: _move_tensors_to_device(v, device) for k, v in data.items()}
+    if isinstance(data, (list, tuple)):
+        return type(data)(_move_tensors_to_device(item, device) for item in data)
+    return data
+
 __all__ = ['WanModel']
 
 def apply_rotary_emb_split(hidden_states, freqs_cis, t_dim):
@@ -1849,6 +1862,11 @@ class WanModel(torch.nn.Module):
         self.prefetch_blocks = 0
         self.block_swap_debug = False
 
+        # Multi-GPU layer split state
+        self.multi_gpu_enabled = False
+        self.block_devices = None  # list of torch.device per block
+        self.multi_gpu_device_boundaries = set()  # block indices where device changes
+
         self.video_attention_split_steps = []
         self.lora_scheduling_enabled = False
 
@@ -2038,7 +2056,7 @@ class WanModel(torch.nn.Module):
         # Clamp blocks_to_swap to valid range
         blocks_to_swap = max(0, min(blocks_to_swap, len(self.blocks)))
 
-        log.info(f"Swapping {blocks_to_swap} transformer blocks")
+        log.info(f"Swapping {blocks_to_swap} transformer blocks" + (f" (prefetch={prefetch_blocks})" if prefetch_blocks > 0 else ""))
         self.blocks_to_swap = blocks_to_swap
         self.prefetch_blocks = prefetch_blocks
         self.block_swap_debug = block_swap_debug
@@ -2092,6 +2110,66 @@ class WanModel(torch.nn.Module):
         log.info(f"Transformer blocks on {self.main_device}: {total_main_memory:.2f}MB")
         log.info(f"Total memory used by transformer blocks: {(total_offload_memory + total_main_memory):.2f}MB")
         log.info(f"Non-blocking memory transfer: {self.use_non_blocking}")
+        log.info("-" * 25)
+
+    def multi_gpu_layer_split(self, devices, block_assignment=None):
+        """Distribute transformer blocks across multiple GPU devices.
+
+        This replaces block_swap when multiple GPUs are available. Each block
+        is permanently placed on its assigned GPU. During forward pass, the
+        hidden state tensor is moved between GPUs at device boundaries.
+
+        Args:
+            devices: List of torch.device objects (e.g. [cuda:0, cuda:1]).
+            block_assignment: Optional list mapping block_idx -> device.
+                If None, blocks are distributed evenly across devices.
+        """
+        num_blocks = len(self.blocks)
+
+        if block_assignment is None:
+            block_assignment = []
+            blocks_per_device = num_blocks // len(devices)
+            remainder = num_blocks % len(devices)
+            for d_idx, device in enumerate(devices):
+                n = blocks_per_device + (1 if d_idx < remainder else 0)
+                block_assignment.extend([device] * n)
+
+        self.block_devices = block_assignment
+        self.multi_gpu_enabled = True
+        self.blocks_to_swap = 0  # Disable block swap
+
+        # Find device boundaries (indices where device changes)
+        self.multi_gpu_device_boundaries = set()
+        for i in range(1, len(block_assignment)):
+            if block_assignment[i] != block_assignment[i - 1]:
+                self.multi_gpu_device_boundaries.add(i)
+
+        # Move blocks to assigned devices
+        memory_per_device = {}
+        for b, block in tqdm(enumerate(self.blocks), total=num_blocks, desc="Distributing blocks across GPUs"):
+            target_device = block_assignment[b]
+            block.to(target_device)
+            dev_str = str(target_device)
+            memory_per_device[dev_str] = memory_per_device.get(dev_str, 0) + get_module_memory_mb(block)
+
+        # Keep VACE blocks on main_device (forward_vace has no multi-GPU boundary handling)
+        if self.vace_layers is not None and hasattr(self, 'vace_blocks') and len(self.vace_blocks) > 0:
+            for block in self.vace_blocks:
+                block.to(devices[0])
+            self.vace_blocks_to_swap = 0
+
+        # Set main_device to primary GPU for embeddings
+        self.main_device = devices[0]
+
+        mm.soft_empty_cache()
+        gc.collect()
+
+        log.info("-" * 25)
+        log.info("Multi-GPU layer split summary:")
+        for dev_str, mem in memory_per_device.items():
+            log.info(f"  {dev_str}: {mem:.2f}MB")
+        log.info(f"Device boundaries at blocks: {self.multi_gpu_device_boundaries}")
+        log.info(f"Total blocks: {num_blocks} across {len(devices)} GPUs")
         log.info("-" * 25)
 
     def forward_vace(
@@ -3200,7 +3278,15 @@ class WanModel(torch.nn.Module):
 
             # Asynchronous block offloading with CUDA streams and events
             if torch.cuda.is_available():
-                cuda_stream = None #torch.cuda.Stream(device=device, priority=0) # todo causes issues on some systems
+                # Enable CUDA stream for async prefetch when prefetch_blocks > 0
+                if self.prefetch_blocks > 0:
+                    try:
+                        cuda_stream = torch.cuda.Stream(device=device, priority=0)
+                    except Exception as e:
+                        log.warning(f"Block swap: CUDA stream creation failed: {e}, prefetch disabled")
+                        cuda_stream = None
+                else:
+                    cuda_stream = None
                 events = [torch.cuda.Event() for _ in self.blocks]
                 swap_start_idx = len(self.blocks) - self.blocks_to_swap if self.blocks_to_swap > 0 else len(self.blocks)
             else:
@@ -3224,6 +3310,20 @@ class WanModel(torch.nn.Module):
 
             for b, block in enumerate(self.blocks):
                 mm.throw_exception_if_processing_interrupted()
+
+                # Multi-GPU: move tensors to block's device at device boundaries
+                if self.multi_gpu_enabled and self.block_devices is not None:
+                    block_device = self.block_devices[b]
+                    if (b == 0 and x.device != block_device) or b in self.multi_gpu_device_boundaries:
+                        x = x.to(block_device, non_blocking=True)
+                        if x_ip is not None:
+                            x_ip = x_ip.to(block_device, non_blocking=True)
+                        if x_ovi is not None:
+                            x_ovi = x_ovi.to(block_device, non_blocking=True)
+                        kwargs = _move_tensors_to_device(kwargs, block_device)
+                        if self.block_swap_debug:
+                            log.info(f"Multi-GPU: moved tensors to {block_device} at block {b}")
+
                 if attention_mode_override_active and b in attn_override_blocks:
                     attention_mode = attention_mode_override['mode']
                 else:
@@ -3392,6 +3492,12 @@ class WanModel(torch.nn.Module):
             x = x[:, -self.original_seq_len:]
         else:
             x = x[:, :self.original_seq_len]
+
+        # Multi-GPU: move x (and x_ovi) back to main_device for head projection
+        if self.multi_gpu_enabled and x.device != self.main_device:
+            x = x.to(self.main_device)
+            if x_ovi is not None:
+                x_ovi = x_ovi.to(self.main_device)
 
         x = self.head(x, e.to(x.device), temp_length=F,
                       e_tr=e_token_replace.to(x.device) if use_token_replace else None, tr_start=token_replace_start, tr_num=replace_token_num)

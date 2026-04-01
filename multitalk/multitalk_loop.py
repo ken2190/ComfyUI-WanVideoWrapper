@@ -31,7 +31,8 @@ def multitalk_loop(self, **kwargs):
      humo_image_cond, humo_image_cond_neg, humo_audio, humo_reference_count,
      add_noise_to_samples, audio_stride, use_tsr, tsr_k, tsr_sigma, fantasy_portrait_input,
      noise, timesteps, force_offload, add_cond, control_latents, audio_proj,
-     control_camera_latents, samples, masks, seed_g, gguf_reader, predict_func
+     control_camera_latents, samples, masks, seed_g, gguf_reader, predict_func,
+     performance_opts, cudnn_benchmark_prev
     ) = (kwargs.get(k) for k in (
         'latent', 'total_steps', 'steps', 'start_step', 'end_step', 'shift', 'cfg',
         'denoise_strength', 'sigmas', 'weight_dtype', 'transformer', 'patcher',
@@ -42,8 +43,25 @@ def multitalk_loop(self, **kwargs):
         'add_noise_to_samples', 'audio_stride', 'use_tsr', 'tsr_k', 'tsr_sigma',
         'fantasy_portrait_input', 'noise', 'timesteps', 'force_offload', 'add_cond',
         'control_latents', 'audio_proj', 'control_camera_latents', 'samples', 'masks',
-        'seed_g', 'gguf_reader', 'predict_with_cfg'
+        'seed_g', 'gguf_reader', 'predict_with_cfg',
+        'performance_opts', 'cudnn_benchmark_prev'
     ))
+
+    # Performance optimization flags
+    perf_opts = performance_opts or {}
+    skip_redundant_encode = perf_opts.get("vae_skip_redundant_encode", False)
+    latent_motion_transfer = perf_opts.get("latent_motion_transfer", False)
+    async_vae = perf_opts.get("async_vae", False)
+
+    # CUDA stream for async VAE model transfers
+    vae_stream = None
+    if async_vae and torch.cuda.is_available():
+        try:
+            vae_stream = torch.cuda.Stream()
+            log.info("Performance: async VAE transfers enabled (CUDA stream)")
+        except Exception as e:
+            log.warning(f"Performance: async VAE stream creation failed: {e}, using synchronous transfers")
+            vae_stream = None
 
     mode = image_embeds.get("multitalk_mode", "multitalk")
     if mode == "auto":
@@ -91,6 +109,7 @@ def multitalk_loop(self, **kwargs):
         multitalk_embeds['ref_target_masks'] = ref_target_masks
 
     gen_video_list = []
+    cached_motion_latent = None
     is_first_clip = True
     arrive_last_frame = False
     cur_motion_frames_num = 1
@@ -255,6 +274,9 @@ def multitalk_loop(self, **kwargs):
                 masks = (1-noise_mask.repeat(len(timesteps), 1, 1, 1, 1).to(device)) > thresholds
 
         # zero padding and vae encode for img cond
+        # Note: when latent_motion_transfer is active, cond_ may be stale (from 2 iterations ago)
+        # because cond_frame/cond_image are not updated when can_skip_decode=True.
+        # This only affects y (image conditioning mask), not latent_motion_frames which uses cached_motion_latent.
         if cond_image is not None or cond_frame is not None:
             cond_ = cond_image if (is_first_clip or humo_image_cond is None) else cond_frame
             cond_frame_num = cond_.shape[2]
@@ -267,15 +289,35 @@ def multitalk_loop(self, **kwargs):
                 video_frames = torch.zeros(1, 3, frame_num-cond_frame_num, target_h, target_w, device=device, dtype=vae.dtype)
                 padding_frames_pixels_values = torch.cat([cond_.to(device, vae.dtype), video_frames], dim=2)
 
-            # encode
-            vae.to(device)
+            # encode (async: start VAE transfer while padding tensor is already prepared)
+            if vae_stream is not None:
+                with torch.cuda.stream(vae_stream):
+                    vae.to(device)
+                vae_stream.synchronize()
+            else:
+                vae.to(device)
             y = vae.encode(padding_frames_pixels_values, device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
 
             if mode == "infinitetalk":
-                cond_ = cond_image if is_first_clip else cond_frame
-                latent_motion_frames = vae.encode(cond_.to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
+                if cached_motion_latent is not None:
+                    # Use diffusion output latent directly (latent-space motion transfer)
+                    latent_motion_frames = cached_motion_latent.to(device, dtype)
+                    cached_motion_latent = None
+                    log.info("Performance: using cached diffusion latent as motion frames")
+                elif skip_redundant_encode:
+                    # Reuse conditioning latent already encoded in y instead of a separate encode
+                    latent_motion_frames = y[:, :cur_motion_frames_latent_num]
+                    log.info("Performance: skipped redundant VAE encode for infinitetalk motion frames")
+                else:
+                    cond_ = cond_image if is_first_clip else cond_frame
+                    latent_motion_frames = vae.encode(cond_.to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False).to(dtype)[0]
             else:
-                latent_motion_frames = y[:, :cur_motion_frames_latent_num] # C T H W
+                if cached_motion_latent is not None:
+                    latent_motion_frames = cached_motion_latent.to(device, dtype)
+                    cached_motion_latent = None
+                    log.info("Performance: using cached diffusion latent as motion frames")
+                else:
+                    latent_motion_frames = y[:, :cur_motion_frames_latent_num] # C T H W
 
             vae.to(offload_device)
 
@@ -465,46 +507,76 @@ def multitalk_loop(self, **kwargs):
         if humo_image_cond is not None and humo_reference_count > 0:
             latent = latent[:,:-humo_reference_count]
 
-        vae.to(device)
-        videos = vae.decode(latent.unsqueeze(0).to(device, vae.dtype), device=device, tiled=tiled_vae, pbar=False)[0].cpu()
-        vae.to(offload_device)
+        # Latent-space motion transfer: skip intermediate decode+encode when possible
+        can_skip_decode = (
+            latent_motion_transfer
+            and not arrive_last_frame
+            and not output_path
+            and colormatch == "disabled"
+            and mode in ("infinitetalk", "multitalk")
+        )
+
+        if can_skip_decode:
+            # Cache motion frame latents directly from diffusion output
+            motion_latent_frames = (motion_frame - 1) // 4 + 1
+            cached_motion_latent = latent[:, -motion_latent_frames:].detach().clone().cpu()
+            # Store latent for deferred decode at the end
+            gen_video_list.append(("latent", latent.detach().clone().cpu(), is_first_clip, cur_motion_frames_num))
+            log.info(f"Performance: skipped VAE decode for iteration {iteration_count} (latent motion transfer)")
+        else:
+            cached_motion_latent = None
+
+            # Async: start VAE model transfer on background stream
+            if vae_stream is not None:
+                with torch.cuda.stream(vae_stream):
+                    vae.to(device)
+                # Prepare decode input while VAE transfers
+                decode_input = latent.unsqueeze(0).to(device, vae.dtype)
+                vae_stream.synchronize()  # Wait for VAE to be on device
+            else:
+                vae.to(device)
+                decode_input = latent.unsqueeze(0).to(device, vae.dtype)
+
+            videos = vae.decode(decode_input, device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+            del decode_input
+            vae.to(offload_device)
+
+            # crop drop_frames from end if enabled
+            if mode == "skyreelsv3" and drop_frames > 0 and not arrive_last_frame:
+                videos = videos[:, :-drop_frames]
+
+            # optional color correction (less relevant for InfiniteTalk)
+            if colormatch != "disabled":
+                if colormatch == "reinhard_torch":
+                    videos = match_and_blend_colors(videos, original_color_reference, 1.0)
+                else:
+                    videos = videos.permute(1, 2, 3, 0).float().numpy()
+                    from color_matcher import ColorMatcher
+                    cm = ColorMatcher()
+                    cm_result_list = []
+                    for img in videos:
+                        if mode == "infinitetalk":
+                            cm_result = cm.transfer(src=img, ref=cond_image[0].permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
+                        else:
+                            cm_result = cm.transfer(src=img, ref=original_images[0].permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
+                        cm_result_list.append(torch.from_numpy(cm_result).to(vae.dtype))
+
+                    videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
+
+            # optionally save generated samples to disk
+            if output_path:
+                video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
+                num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
+                log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
+                start_idx = 0 if is_first_clip else cur_motion_frames_num
+                for i in range(start_idx, video_np.shape[0]):
+                    im = Image.fromarray(video_np[i])
+                    im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
+                    img_counter += 1
+            else:
+                gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
 
         sampling_pbar.close()
-
-        # crop drop_frames from end if enabled
-        if mode == "skyreelsv3" and drop_frames > 0 and not arrive_last_frame:
-            videos = videos[:, :-drop_frames]
-
-        # optional color correction (less relevant for InfiniteTalk)
-        if colormatch != "disabled":
-            if colormatch == "reinhard_torch":
-                videos = match_and_blend_colors(videos, original_color_reference, 1.0)
-            else:
-                videos = videos.permute(1, 2, 3, 0).float().numpy()
-                from color_matcher import ColorMatcher
-                cm = ColorMatcher()
-                cm_result_list = []
-                for img in videos:
-                    if mode == "infinitetalk":
-                        cm_result = cm.transfer(src=img, ref=cond_image[0].permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
-                    else:
-                        cm_result = cm.transfer(src=img, ref=original_images[0].permute(1, 2, 3, 0).squeeze(0).cpu().float().numpy(), method=colormatch)
-                    cm_result_list.append(torch.from_numpy(cm_result).to(vae.dtype))
-
-                videos = torch.stack(cm_result_list, dim=0).permute(3, 0, 1, 2)
-
-        # optionally save generated samples to disk
-        if output_path:
-            video_np = videos.clamp(-1.0, 1.0).add(1.0).div(2.0).mul(255).cpu().float().numpy().transpose(1, 2, 3, 0).astype('uint8')
-            num_frames_to_save = video_np.shape[0] if is_first_clip else video_np.shape[0] - cur_motion_frames_num
-            log.info(f"Saving {num_frames_to_save} generated frames to {output_path}")
-            start_idx = 0 if is_first_clip else cur_motion_frames_num
-            for i in range(start_idx, video_np.shape[0]):
-                im = Image.fromarray(video_np[i])
-                im.save(os.path.join(output_path, f"frame_{img_counter:05d}.png"))
-                img_counter += 1
-        else:
-            gen_video_list.append(videos if is_first_clip else videos[:, cur_motion_frames_num:])
 
         current_condframe_index += 1
         iteration_count += 1
@@ -517,13 +589,16 @@ def multitalk_loop(self, **kwargs):
         is_first_clip = False
         cur_motion_frames_num = motion_frame
 
-        cond_ = videos[:, -cur_motion_frames_num:].unsqueeze(0)
-        if mode == "infinitetalk":
-            cond_frame = cond_
-        else:
-            cond_image = cond_
+        if not can_skip_decode:
+            cond_ = videos[:, -cur_motion_frames_num:].unsqueeze(0)
+            if mode == "infinitetalk":
+                cond_frame = cond_
+            else:
+                cond_image = cond_
 
-        del videos, latent
+        del latent
+        if not can_skip_decode:
+            del videos
 
         # Repeat audio emb
         if multitalk_embeds is not None:
@@ -554,7 +629,28 @@ def multitalk_loop(self, **kwargs):
                 original_images = torch.cat([original_images, last_frame.repeat(1, 1, miss_length, 1, 1)], dim=2)
 
     if not output_path:
-        gen_video_samples = torch.cat(gen_video_list, dim=1)
+        # Decode any deferred latents from latent_motion_transfer.
+        # Color matching and drop_frames are not applied here because can_skip_decode
+        # requires colormatch=="disabled" and mode not in skyreelsv3.
+        decoded_list = []
+        for entry in gen_video_list:
+            if isinstance(entry, tuple) and len(entry) == 4 and entry[0] == "latent":
+                _, lat, was_first, motion_num = entry
+                if vae_stream is not None:
+                    with torch.cuda.stream(vae_stream):
+                        vae.to(device)
+                    decode_input = lat.unsqueeze(0).to(device, vae.dtype)
+                    vae_stream.synchronize()
+                else:
+                    vae.to(device)
+                    decode_input = lat.unsqueeze(0).to(device, vae.dtype)
+                decoded = vae.decode(decode_input, device=device, tiled=tiled_vae, pbar=False)[0].cpu()
+                del decode_input
+                vae.to(offload_device)
+                decoded_list.append(decoded if was_first else decoded[:, motion_num:])
+            else:
+                decoded_list.append(entry)
+        gen_video_samples = torch.cat(decoded_list, dim=1)
     else:
         gen_video_samples = torch.zeros(3, 1, 64, 64) # dummy output
 
@@ -566,4 +662,6 @@ def multitalk_loop(self, **kwargs):
         torch.cuda.reset_peak_memory_stats(device)
     except:
         pass
+    if cudnn_benchmark_prev is not None:
+        torch.backends.cudnn.benchmark = cudnn_benchmark_prev
     return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},

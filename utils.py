@@ -59,6 +59,12 @@ def offload_transformer(transformer, remove_lora=True):
     transformer.magcache_state.clear_all()
     transformer.easycache_state.clear_all()
 
+    # Reset multi-GPU state so next run re-distributes fresh
+    if getattr(transformer, 'multi_gpu_enabled', False):
+        transformer.multi_gpu_enabled = False
+        transformer.block_devices = None
+        transformer.multi_gpu_device_boundaries = set()
+
     if transformer.patched_linear:
         for name, param in transformer.named_parameters():
             if "loras" in name or "controlnet" in name:
@@ -90,7 +96,7 @@ def offload_transformer(transformer, remove_lora=True):
     gc.collect()
 
 
-def init_blockswap(transformer, block_swap_args, model):
+def init_blockswap(transformer, block_swap_args, model, prefetch_blocks=0):
     if not transformer.patched_linear:
         if block_swap_args is not None:
             for name, param in transformer.named_parameters():
@@ -106,6 +112,7 @@ def init_blockswap(transformer, block_swap_args, model):
                 block_swap_args["offload_txt_emb"],
                 block_swap_args["offload_img_emb"],
                 vace_blocks_to_swap = block_swap_args.get("vace_blocks_to_swap", None),
+                prefetch_blocks=prefetch_blocks,
             )
         elif model["auto_cpu_offload"]:
             for module in transformer.modules():

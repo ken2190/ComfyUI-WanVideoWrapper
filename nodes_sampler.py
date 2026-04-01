@@ -69,6 +69,8 @@ class WanVideoSampler:
                 "start_step": ("INT", {"default": 0, "min": 0, "max": 10000, "step": 1, "tooltip": "Start step for the sampling, 0 means full sampling, otherwise samples only from this step"}),
                 "end_step": ("INT", {"default": -1, "min": -1, "max": 10000, "step": 1, "tooltip": "End step for the sampling, -1 means full sampling, otherwise samples only until this step"}),
                 "add_noise_to_samples": ("BOOLEAN", {"default": False, "tooltip": "Add noise to the samples before sampling, needed for video2video sampling when starting from clean video"}),
+                "performance_opts": ("PERFORMANCEOPTS", ),
+                "multi_gpu_opts": ("MULTIGPUOPTS", ),
             }
         }
 
@@ -80,9 +82,17 @@ class WanVideoSampler:
     def process(self, model, image_embeds, shift, steps, cfg, seed, scheduler, riflex_freq_index, text_embeds=None,
         force_offload=True, samples=None, feta_args=None, denoise_strength=1.0, context_options=None,
         cache_args=None, teacache_args=None, flowedit_args=None, batched_cfg=False, slg_args=None, rope_function="default", loop_args=None,
-        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False):
+        experimental_args=None, sigmas=None, unianimate_poses=None, fantasytalking_embeds=None, uni3c_embeds=None, multitalk_embeds=None, freeinit_args=None, start_step=0, end_step=-1, add_noise_to_samples=False, performance_opts=None, multi_gpu_opts=None):
         if flowedit_args is not None:
             raise Exception("FlowEdit support has been deprecated and removed due to lack of use and code maintainability")
+
+        # Performance optimizations
+        perf_opts = performance_opts or {}
+        cudnn_benchmark_prev = torch.backends.cudnn.benchmark
+        if perf_opts.get("cudnn_benchmark", False):
+            torch.backends.cudnn.benchmark = True
+            log.info("cuDNN benchmark mode enabled for this sampling run")
+
         patcher = model
         model = model.model
         transformer = model.diffusion_model
@@ -873,15 +883,61 @@ class WanVideoSampler:
         gc.collect()
 
         #blockswap init
-        init_blockswap(transformer, block_swap_args, model)
+        _prefetch = perf_opts.get("block_swap_prefetch", 0)
+        init_blockswap(transformer, block_swap_args, model, prefetch_blocks=_prefetch)
+
+        # Multi-GPU setup (after blockswap/weights are loaded)
+        multi_gpu_active = False
+        cfg_parallel_active = False
+        transformer_uncond = None  # Second transformer copy for CFG parallel
+        if multi_gpu_opts is not None:
+            from .multi_gpu_utils import validate_gpu_config, split_devices_for_cfg
+            strategy = multi_gpu_opts.get("strategy", "layer_split")
+            gpu_devices = validate_gpu_config(
+                multi_gpu_opts.get("num_gpus", 0),
+                multi_gpu_opts.get("primary_gpu", 0)
+            )
+            if gguf_reader is not None and len(gpu_devices) >= 2:
+                log.warning("MultiGPU: GGUF models with multi-GPU is experimental")
+
+            if len(gpu_devices) >= 2 and strategy == "cfg_parallel":
+                cond_devices, uncond_devices = split_devices_for_cfg(gpu_devices)
+                log.info(f"Multi-GPU CFG parallel: cond on {[str(d) for d in cond_devices]}, uncond on {[str(d) for d in uncond_devices]}")
+
+                # Setup cond transformer on cond GPU group
+                transformer.multi_gpu_layer_split(cond_devices)
+
+                # Deep copy transformer for uncond pass on uncond GPU group
+                try:
+                    transformer_uncond = copy.deepcopy(transformer)
+                    transformer_uncond.multi_gpu_layer_split(uncond_devices)
+                    cfg_parallel_active = True
+                    multi_gpu_active = True
+                    log.info(f"Multi-GPU: cfg_parallel active - cond on {len(cond_devices)} GPUs, uncond on {len(uncond_devices)} GPUs")
+                except Exception as e:
+                    log.warning(f"MultiGPU: Failed to create uncond transformer copy: {e}. Falling back to layer_split.")
+                    transformer_uncond = None
+                    cfg_parallel_active = False
+                    # Fall back: use all GPUs for layer_split
+                    transformer.multi_gpu_layer_split(gpu_devices)
+                    multi_gpu_active = True
+
+            elif len(gpu_devices) >= 2 and strategy == "layer_split":
+                transformer.multi_gpu_layer_split(gpu_devices)
+                multi_gpu_active = True
+                log.info(f"Multi-GPU: layer_split active with {len(gpu_devices)} GPUs")
 
         # Initialize Cache if enabled
         previous_cache_states = None
         transformer.enable_teacache = transformer.enable_magcache = transformer.enable_easycache = False
+        if transformer_uncond is not None:
+            transformer_uncond.enable_teacache = transformer_uncond.enable_magcache = transformer_uncond.enable_easycache = False
         cache_args = teacache_args if teacache_args is not None else cache_args #for backward compatibility on old workflows
         if cache_args is not None:
             from .cache_methods.cache_methods import set_transformer_cache_method
             transformer = set_transformer_cache_method(transformer, timesteps, cache_args)
+            if transformer_uncond is not None:
+                transformer_uncond = set_transformer_cache_method(transformer_uncond, timesteps, cache_args)
 
             # Initialize cache state
             if samples is not None:
@@ -1162,6 +1218,18 @@ class WanVideoSampler:
                 prev_ones = torch.ones(20, *prev_latents.shape[1:], device=device, dtype=dtype)
                 dual_control_input["prev_latent"] = torch.cat([prev_ones, prev_latents]).unsqueeze(0)
 
+        # Pre-cache static tensors on device to avoid redundant per-step .to(device) transfers
+        if perf_opts.get("cache_device_tensors", False):
+            if wananim_pose_latents is not None and wananim_pose_latents.device != device:
+                wananim_pose_latents = wananim_pose_latents.to(device)
+                log.info("Performance: pre-cached wananim_pose_latents on device")
+            if wananim_face_pixels is not None and wananim_face_pixels.device != device:
+                wananim_face_pixels = wananim_face_pixels.to(device, torch.float32)
+                log.info("Performance: pre-cached wananim_face_pixels on device")
+
+        # Cache for null audio tensor used in audio CFG (avoids torch.zeros_like per step)
+        _cached_null_audio = {}  # keyed by shape tuple for safety
+
         #region model pred
         def predict_with_cfg(z, cfg_scale, positive_embeds, negative_embeds, timestep, idx, image_cond=None, clip_fea=None,
                              control_latents=None, vace_data=None, unianim_data=None, audio_proj=None, control_camera_latents=None,
@@ -1172,8 +1240,10 @@ class WanVideoSampler:
             nonlocal transformer
             nonlocal audio_cfg_scale
 
-            autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear)
-            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=dtype) if autocast_enabled else nullcontext():
+            fp16_autocast = perf_opts.get("fp16_autocast", False)
+            autocast_enabled = ("fp8" in model["quantization"] and not transformer.patched_linear) or fp16_autocast
+            autocast_dtype = torch.float16 if fp16_autocast else dtype
+            with torch.autocast(device_type=mm.get_autocast_device(device), dtype=autocast_dtype) if autocast_enabled else nullcontext():
 
                 if use_cfg_zero_star and (idx <= zero_star_steps) and use_zero_init:
                     return z*0, None
@@ -1505,54 +1575,140 @@ class WanVideoSampler:
 
                 try:
                     if not batched_cfg:
-                        #conditional (positive) pass
-                        if pos_latent is not None: # for humo
-                            base_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
-                        base_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None # QwenVL embeddings for Bindweave
-                        noise_pred_cond, noise_pred_ovi, cache_state_cond = transformer(
-                            context=positive_embeds,
-                            pred_id=cache_state[0] if cache_state else None,
-                            vace_data=vace_data, attn_cond=attn_cond,
-                            **base_params
-                        )
-                        noise_pred_cond = noise_pred_cond[0]
-                        noise_pred_ovi = noise_pred_ovi[0] if noise_pred_ovi is not None else None
-                        if math.isclose(cfg_scale, 1.0):
-                            if use_fresca:
-                                noise_pred_cond = fourier_filter(noise_pred_cond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
-                            if fantasy_portrait_input is not None and not math.isclose(portrait_cfg[idx], 1.0):
-                                base_params["fantasy_portrait_input"] = None
-                                noise_pred_no_portrait, noise_pred_ovi, cache_state_uncond = transformer(context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
-                                vace_data=vace_data, attn_cond=attn_cond, **base_params)
-                                return noise_pred_no_portrait[0] + portrait_cfg[idx] * (noise_pred_cond - noise_pred_no_portrait[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
-                            elif multitalk_audio_input is not None and not math.isclose(audio_cfg_scale[idx], 1.0):
-                                base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:]
-                                noise_pred_uncond_audio, _, cache_state_uncond = transformer(
-                                context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
-                                vace_data=vace_data, attn_cond=attn_cond, **base_params)
-                                return noise_pred_uncond_audio[0] + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_uncond_audio[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
-                            else:
-                                return noise_pred_cond, noise_pred_ovi, [cache_state_cond]
+                        # ---- CFG Parallel path: run cond + uncond simultaneously on separate GPUs ----
+                        if cfg_parallel_active and not math.isclose(cfg_scale, 1.0) and transformer_uncond is not None:
+                            from concurrent.futures import ThreadPoolExecutor
+                            from .wanvideo.modules.model import _move_tensors_to_device
 
-                        #unconditional (negative) pass
-                        base_params['is_uncond'] = True
-                        base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
-                        base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
-                        base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
-                        if wananim_face_pixels is not None:
-                            base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
-                        if humo_audio_input_neg is not None:
-                            base_params['humo_audio'] = humo_audio_input_neg
-                        if neg_latent is not None:
-                            base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+                            # Prepare cond params
+                            cond_params = dict(base_params)
+                            if pos_latent is not None:
+                                cond_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
+                            cond_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None
 
-                        noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
-                            context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti #t
-                            pred_id=cache_state[1] if cache_state else None,
-                            vace_data=vace_data, attn_cond=attn_cond_neg,
-                            **base_params)
-                        noise_pred_uncond_text = noise_pred_uncond_text[0]
-                        noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
+                            # Prepare uncond params (separate copy, moved to uncond device)
+                            uncond_params = dict(base_params)
+                            uncond_params['is_uncond'] = True
+                            uncond_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            uncond_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None
+                            uncond_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params.get('y')
+                            if wananim_face_pixels is not None:
+                                uncond_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                            if humo_audio_input_neg is not None:
+                                uncond_params['humo_audio'] = humo_audio_input_neg
+                            if neg_latent is not None:
+                                uncond_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+
+                            # Move uncond params to uncond transformer's primary device
+                            uncond_primary = transformer_uncond.main_device
+                            uncond_params = _move_tensors_to_device(uncond_params, uncond_primary)
+                            uncond_context = [e.to(uncond_primary) for e in (negative_embeds if humo_audio_input_neg is None else positive_embeds)]
+                            uncond_vace = _move_tensors_to_device(vace_data, uncond_primary) if vace_data is not None else None
+                            uncond_attn_cond = _move_tensors_to_device(attn_cond_neg, uncond_primary) if attn_cond_neg is not None else None
+
+                            cond_cache_id = cache_state[0] if cache_state else None
+                            uncond_cache_id = cache_state[1] if cache_state else None
+
+                            def _run_cond():
+                                return transformer(
+                                    context=positive_embeds,
+                                    pred_id=cond_cache_id,
+                                    vace_data=vace_data, attn_cond=attn_cond,
+                                    **cond_params)
+
+                            def _run_uncond():
+                                return transformer_uncond(
+                                    context=uncond_context,
+                                    pred_id=uncond_cache_id,
+                                    vace_data=uncond_vace, attn_cond=uncond_attn_cond,
+                                    **uncond_params)
+
+                            # Run both passes in parallel (CUDA releases GIL)
+                            with ThreadPoolExecutor(max_workers=2) as pool:
+                                fut_cond = pool.submit(_run_cond)
+                                fut_uncond = pool.submit(_run_uncond)
+                                cond_result = fut_cond.result()
+                                uncond_result = fut_uncond.result()
+
+                            noise_pred_cond = cond_result[0][0]
+                            noise_pred_ovi = cond_result[1][0] if cond_result[1] is not None else None
+                            cache_state_cond = cond_result[2]
+
+                            # Move uncond result back to cond device for CFG combine
+                            noise_pred_uncond_text = uncond_result[0][0].to(noise_pred_cond.device)
+                            noise_pred_ovi_uncond = uncond_result[1][0].to(noise_pred_cond.device) if uncond_result[1] is not None else None
+                            cache_state_uncond = uncond_result[2]
+
+                            # Also update base_params to uncond state for any subsequent special CFG passes
+                            base_params['is_uncond'] = True
+                            base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None
+                            base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                            if wananim_face_pixels is not None:
+                                base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                            if humo_audio_input_neg is not None:
+                                base_params['humo_audio'] = humo_audio_input_neg
+                            if neg_latent is not None:
+                                base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+
+                        # ---- Standard sequential path ----
+                        else:
+                            #conditional (positive) pass
+                            if pos_latent is not None: # for humo
+                                base_params['x'] = [torch.cat([z[:, :-humo_reference_count], pos_latent], dim=1)]
+                            base_params["add_text_emb"] = qwenvl_embeds_pos.to(device) if qwenvl_embeds_pos is not None else None # QwenVL embeddings for Bindweave
+                            noise_pred_cond, noise_pred_ovi, cache_state_cond = transformer(
+                                context=positive_embeds,
+                                pred_id=cache_state[0] if cache_state else None,
+                                vace_data=vace_data, attn_cond=attn_cond,
+                                **base_params
+                            )
+                            noise_pred_cond = noise_pred_cond[0]
+                            noise_pred_ovi = noise_pred_ovi[0] if noise_pred_ovi is not None else None
+                            if math.isclose(cfg_scale, 1.0):
+                                if use_fresca:
+                                    noise_pred_cond = fourier_filter(noise_pred_cond, fresca_scale_low, fresca_scale_high, fresca_freq_cutoff)
+                                if fantasy_portrait_input is not None and not math.isclose(portrait_cfg[idx], 1.0):
+                                    base_params["fantasy_portrait_input"] = None
+                                    noise_pred_no_portrait, noise_pred_ovi, cache_state_uncond = transformer(context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                    return noise_pred_no_portrait[0] + portrait_cfg[idx] * (noise_pred_cond - noise_pred_no_portrait[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
+                                elif multitalk_audio_input is not None and not math.isclose(audio_cfg_scale[idx], 1.0):
+                                    # Use cached null audio tensor to avoid per-step allocation
+                                    _null_key = multitalk_audio_input.shape
+                                    if perf_opts.get("cache_audio_null", False) and _null_key in _cached_null_audio:
+                                        base_params['multitalk_audio'] = _cached_null_audio[_null_key]
+                                    else:
+                                        _null_audio = torch.zeros_like(multitalk_audio_input)[-1:]
+                                        if perf_opts.get("cache_audio_null", False):
+                                            _cached_null_audio[_null_key] = _null_audio
+                                        base_params['multitalk_audio'] = _null_audio
+                                    noise_pred_uncond_audio, _, cache_state_uncond = transformer(
+                                    context=positive_embeds, pred_id=cache_state[0] if cache_state else None,
+                                    vace_data=vace_data, attn_cond=attn_cond, **base_params)
+                                    return noise_pred_uncond_audio[0] + audio_cfg_scale[idx] * (noise_pred_cond - noise_pred_uncond_audio[0]), noise_pred_ovi, [cache_state_cond, cache_state_uncond]
+                                else:
+                                    return noise_pred_cond, noise_pred_ovi, [cache_state_cond]
+
+                            #unconditional (negative) pass
+                            base_params['is_uncond'] = True
+                            base_params['clip_fea'] = clip_fea_neg if clip_fea_neg is not None else clip_fea
+                            base_params["add_text_emb"] = qwenvl_embeds_neg.to(device) if qwenvl_embeds_neg is not None else None # QwenVL embeddings for Bindweave
+                            base_params['y'] = [image_cond_neg.to(z)] if image_cond_neg is not None else base_params['y']
+                            if wananim_face_pixels is not None:
+                                base_params['wananim_face_pixel_values'] = torch.zeros_like(wananim_face_pixels).to(device, torch.float32) - 1
+                            if humo_audio_input_neg is not None:
+                                base_params['humo_audio'] = humo_audio_input_neg
+                            if neg_latent is not None:
+                                base_params['x'] = [torch.cat([z[:, :-humo_reference_count], neg_latent], dim=1)]
+
+                            noise_pred_uncond_text, noise_pred_ovi_uncond, cache_state_uncond = transformer(
+                                context=negative_embeds if humo_audio_input_neg is None else positive_embeds, #ti #t
+                                pred_id=cache_state[1] if cache_state else None,
+                                vace_data=vace_data, attn_cond=attn_cond_neg,
+                                **base_params)
+                            noise_pred_uncond_text = noise_pred_uncond_text[0]
+                            noise_pred_ovi_uncond = noise_pred_ovi_uncond[0] if noise_pred_ovi_uncond is not None else None
 
                         # HuMo
                         if not math.isclose(humo_audio_cfg_scale[idx], 1.0):
@@ -1606,7 +1762,18 @@ class WanVideoSampler:
                                     cache_state.append(None)
 
                                 base_params['audio_proj'] = None
-                                base_params['multitalk_audio'] = torch.zeros_like(multitalk_audio_input)[-1:] if multitalk_audio_input is not None else None
+                                # Use cached null audio tensor to avoid per-step allocation
+                                if multitalk_audio_input is not None:
+                                    _null_key = multitalk_audio_input.shape
+                                    if perf_opts.get("cache_audio_null", False) and _null_key in _cached_null_audio:
+                                        base_params['multitalk_audio'] = _cached_null_audio[_null_key]
+                                    else:
+                                        _null_audio = torch.zeros_like(multitalk_audio_input)[-1:]
+                                        if perf_opts.get("cache_audio_null", False):
+                                            _cached_null_audio[_null_key] = _null_audio
+                                        base_params['multitalk_audio'] = _null_audio
+                                else:
+                                    base_params['multitalk_audio'] = None
                                 base_params['is_uncond'] = False
                                 noise_pred_uncond_audio, _, cache_state_audio = transformer(
                                     context=negative_embeds,
@@ -1659,6 +1826,7 @@ class WanVideoSampler:
                         )
                 except Exception as e:
                     log.error(f"Error during model prediction: {e}")
+                    torch.backends.cudnn.benchmark = cudnn_benchmark_prev
                     if force_offload:
                         if not model["auto_cpu_offload"]:
                             offload_transformer(transformer)
@@ -2184,6 +2352,7 @@ class WanVideoSampler:
                             torch.cuda.reset_peak_memory_stats(device)
                         except:
                             pass
+                        torch.backends.cudnn.benchmark = cudnn_benchmark_prev
                         return {"video": gen_video_samples},
                     # region wananimate loop
                     elif wananimate_loop:
@@ -2367,7 +2536,7 @@ class WanVideoSampler:
                                 elif gguf_reader is not None: #handle GGUF
                                     load_weights(transformer, patcher.model["sd"], base_dtype=dtype, transformer_load_device=device, patcher=patcher, gguf=True, reader=gguf_reader, block_swap_args=block_swap_args)
                                 #blockswap init
-                                init_blockswap(transformer, block_swap_args, model)
+                                init_blockswap(transformer, block_swap_args, model, prefetch_blocks=_prefetch)
 
                             # Use the appropriate prompt for this section
                             if len(text_embeds["prompt_embeds"]) > 1:
@@ -2485,6 +2654,7 @@ class WanVideoSampler:
                             torch.cuda.reset_peak_memory_stats(device)
                         except:
                             pass
+                        torch.backends.cudnn.benchmark = cudnn_benchmark_prev
                         return {"video": gen_video_samples.permute(1, 2, 3, 0), "output_path": output_path},
 
                     #region normal inference
@@ -2593,6 +2763,7 @@ class WanVideoSampler:
 
             except Exception as e:
                 log.error(f"Error during sampling: {e}")
+                torch.backends.cudnn.benchmark = cudnn_benchmark_prev
                 if force_offload:
                     if not model["auto_cpu_offload"]:
                         offload_transformer(transformer)
@@ -2629,6 +2800,7 @@ class WanVideoSampler:
             torch.cuda.reset_peak_memory_stats(device)
         except:
             pass
+        torch.backends.cudnn.benchmark = cudnn_benchmark_prev
         return ({
             "samples": latent.unsqueeze(0).cpu(),
             "looped": is_looped,
